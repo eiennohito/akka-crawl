@@ -20,7 +20,7 @@ import scala.collection.mutable
   */
 class AkkaSpider(asys: ActorSystem, val filter: StringBasedFilter) extends StrictLogging {
   private val http = Http(asys)
-  val botName = "KU-akka"
+  val botName = "KU-akka-bot"
   val rootMat = ActorMaterializer.create(asys)
   val factory = new RequestFactory
 
@@ -127,7 +127,7 @@ class RequestFactory {
     `Accept-Charset`(HttpCharsetRange(HttpCharsets.`UTF-8`)),
     Connection("keep-alive"),
     `User-Agent`(
-      ProductVersion("Kyoto-University-Kurohashi-Lab-Crawler-Ng", "0.1-beta"),
+      ProductVersion("KU-akka-bot", "0.1-beta"),
       ProductVersion("akka-http", "2.4.11")
     )
   )
