@@ -27,9 +27,10 @@
 
   <logger name="org.eiennohito.crawl.http.CrawlContext" level="TRACE" />
   <logger name="org.eiennohito.crawl.http.AkkaSpider$" level="TRACE" />
-  <logger name="org.eiennohito.crawl.http.HostHandler" level="TRACE" />
-  <logger name="org.eiennohito.crawl.http.HostPageSource" level="TRACE" />
+  <logger name="org.eiennohito.crawl.http.HostHandler2" level="TRACE" />
+  <logger name="org.eiennohito.crawl.http.HostPageSource" level="INFO" />
   <logger name="com.optimaize.langdetect" level="INFO" />
+  <logger name="akka" level="INFO" />
 
   <root level="DEBUG">
     <appender-ref ref="console"/>

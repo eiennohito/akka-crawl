@@ -34,7 +34,8 @@ class NumberHandler(spider: AkkaSpider, maxConcurrent: Int) extends Actor with S
 
   override def receive: Receive = {
     case StartCrawl => ctx.startCrawl(context, maxConcurrent)
-    case HostHandler.Completed(uri) => ctx.complete(uri)
+    case HostHandler.Completed(uri, paths) => ctx.complete(uri)
+    case HostHandler.Skipped(uri) => ctx.skip(uri)
     case doc: ProcessedDocument =>
       numDocs += 1
       numBytes += doc.doc.read
@@ -62,7 +63,6 @@ object NumberHandler {
 
 
 class CrawlContext(spider: AkkaSpider)(implicit sender: ActorRef) extends StrictLogging {
-
   def extractImpl(refer: Uri, d: Document): Unit = {
     val trav = new NodeTraversor(new NodeVisitor {
       private val baseUrl = URL.parse(refer.toString())
@@ -71,13 +71,15 @@ class CrawlContext(spider: AkkaSpider)(implicit sender: ActorRef) extends Strict
           if (node.hasAttr("href")) {
             val lnk = node.attr("href")
 
-            if (lnk.startsWith("javascript:")) return
+            val lower = lnk.toLowerCase
+
+            if (lower.startsWith("javascript:") || lower.startsWith("mailto:")) return
 
             try {
               val java = URL.parse(baseUrl, lnk)
 
               val path = java.path()
-              if (!spider.filter.filter(path)) return
+              if (path != null && !spider.filter.accept(path)) return
 
               val uri = Uri(
                 scheme = java.scheme(),
@@ -93,8 +95,7 @@ class CrawlContext(spider: AkkaSpider)(implicit sender: ActorRef) extends Strict
 
               handleUri(refer, uri)
             } catch {
-              case e: Exception =>
-                logger.warn(s"could not parse uri: $lnk", e)
+              case e: Exception => spider.invalidUri(refer, lnk)
             }
           }
         }
@@ -106,8 +107,8 @@ class CrawlContext(spider: AkkaSpider)(implicit sender: ActorRef) extends Strict
 
   def extract(doc: ProcessedDocument): Unit = {
     val lang = doc.doc.lang
-    if (!lang.contains("ja")) {
-      logger.trace(s"${doc.uri} was not Jp enough, it was $lang")
+    if (!lang.contains("ja") && doc.uri.path != Path.SingleSlash) {
+      logger.trace(s"${doc.uri} was not Jp enough, it was $lang: ${doc.doc.charset}")
       return
     }
 
@@ -117,13 +118,21 @@ class CrawlContext(spider: AkkaSpider)(implicit sender: ActorRef) extends Strict
     }
   }
 
+  def skip(base: Uri): Unit = {
+    logger.trace(s"host $base was skipped")
+    ignore.add(base)
+  }
+
   def complete(uri: Uri): Unit = {
     logger.trace(s"host $uri is completed")
     active.remove(uri).foreach(_ ! PoisonPill)
   }
 
-  def addUri(uri: Uri) = {
+  def addUri(uri: Uri): Unit = {
     val base = CrawlContext.baseUri(uri)
+
+    if (ignore.contains(base)) return
+
     active.get(base) match {
       case Some(actor) => actor ! uri
       case _ => pending.get(base) match {
@@ -151,13 +160,15 @@ class CrawlContext(spider: AkkaSpider)(implicit sender: ActorRef) extends Strict
 
   val pending = new mutable.HashMap[Uri, mutable.HashSet[Uri]]()
   val active = new mutable.HashMap[Uri, ActorRef]()
+  val ignore = new mutable.HashSet[Uri]()
+
   var links = 0L
 
   private def doStart(toLaunch: Int, fact: ActorRefFactory) = {
     val uris = selectUris(toLaunch)
     for (u <- uris) {
       logger.trace(s"starting crawling host $u")
-      val props = Props(new HostHandler(u, spider))
+      val props = Props(new HostHandler2(u, spider))
       val actor = fact.actorOf(props)
       active.put(u, actor)
       pending.remove(u).foreach { uris =>

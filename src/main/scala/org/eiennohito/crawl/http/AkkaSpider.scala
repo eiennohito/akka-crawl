@@ -4,30 +4,45 @@ import akka.actor.{ActorRef, ActorSystem, Props}
 import akka.http.scaladsl.Http
 import akka.http.scaladsl.model._
 import akka.http.scaladsl.model.headers._
+import akka.http.scaladsl.settings.ClientConnectionSettings
 import akka.stream._
 import akka.stream.actor.{ActorPublisher, ActorPublisherMessage}
-import akka.stream.scaladsl.{Broadcast, Flow, GraphDSL, Keep, Partition, Sink, Source, Zip}
+import akka.stream.scaladsl.{Broadcast, Flow, GraphDSL, Keep, Sink, Source, Zip}
 import com.typesafe.scalalogging.StrictLogging
 import crawlercommons.robots.BaseRobotRules
-import org.eiennohito.streams.MatActorSendStage
 import org.jsoup.parser.Parser
 
 import scala.collection.mutable
+import scala.concurrent.duration.{FiniteDuration, _}
 
 /**
   * @author eiennohito
   * @since 2016-08-14
   */
-class AkkaSpider(asys: ActorSystem, val filter: StringBasedFilter) extends StrictLogging {
+class AkkaSpider(asys: ActorSystem, val filter: StringBasedFilter, val timeout: FiniteDuration = 5.seconds) extends StrictLogging {
   private val http = Http(asys)
   val botName = "KU-akka-bot"
   val rootMat = ActorMaterializer.create(asys)
   val factory = new RequestFactory
 
+  private val ua = `User-Agent`(
+    ProductVersion(botName, "0.1-beta"),
+    ProductVersion("akka-http", "2.4.11")
+  )
+
+  val settings = ClientConnectionSettings(asys)
+    .withUserAgentHeader(Some(ua))
+
+  def invalidUri(refer: Uri, lnk: String): Unit = {
+
+  }
+
   def pipeline(scheme: String, host: String, port: Int, notify: Sink[UriHandled, _]) = {
+    val loggingAdapter = new SpiderHtmlLogAdapter(host)
+
     val conn = scheme.toLowerCase match {
-      case "http" => http.outgoingConnection(host = host, port = port)
-      case "https" => http.outgoingConnectionHttps(host = host, port = port)
+      case "http" => http.outgoingConnection(host = host, port = port, log = loggingAdapter)
+      case "https" => http.outgoingConnectionHttps(host = host, port = port, log = loggingAdapter)
       case _ =>
         logger.warn(s"invalid scheme: $scheme")
         Flow.fromSinkAndSource(Sink.cancelled, Source.empty)
@@ -36,8 +51,7 @@ class AkkaSpider(asys: ActorSystem, val filter: StringBasedFilter) extends Stric
   }
 }
 
-case class HandleRedirect(req: HttpRequest, resp: HttpResponse)
-case class UriHandled(uri: Uri, status: StatusCode)
+case class UriHandled(uri: Uri, status: StatusCode, headers: Seq[HttpHeader])
 case class ProcessedDocument(uri: Uri, doc: ParsedDocument, headers: Seq[HttpHeader])
 
 object AkkaSpider extends StrictLogging {
@@ -65,15 +79,8 @@ object AkkaSpider extends StrictLogging {
 
     type ReqResp = (HttpRequest, HttpResponse)
 
-    val ourConn = if (logger.underlying.isTraceEnabled) {
-      Flow[HttpRequest].map(f => {
-        logger.trace(s"req: ${f.uri}")
-        f
-      }).viaMat(conn)(Keep.right)
-    } else conn
-
     import GraphDSL.Implicits._
-    val graph = GraphDSL.create(src, ourConn) (Keep.both) { implicit b => (is, conn) =>
+    val graph = GraphDSL.create(src, conn) (Keep.both) { implicit b => (is, conn) =>
 
       val input = is.out.throttle(1, 5.seconds, 1, ThrottleMode.Shaping)
       val bc = b.add(Broadcast[HttpRequest](2))
@@ -84,33 +91,25 @@ object AkkaSpider extends StrictLogging {
       bc ~> zip.in0
       bc ~> conn ~> zip.in1
 
-      val actorSender = b.add(new MatActorSendStage)
-
-      b.materializedValue.map { case (a, _) => a } ~> actorSender.in0
-
-      val handleStatus = b.add(Partition[ReqResp](3, { case (_, resp) =>
-        val status = resp.status
-        if (status.intValue() == 200) 0
-        else if (status.isRedirection()) 1
-        else 2
-      }))
-
       val zipbcast = b.add(Broadcast[ReqResp](2))
 
       zip.out ~> zipbcast.in
 
-      zipbcast.out(0).map { case (req, resp) => UriHandled(req.uri, resp.status) } ~> notifyHandled
-      zipbcast.out(1) ~> handleStatus
+      zipbcast.out(0).map { case (req, resp) =>
+        if (logger.underlying.isTraceEnabled()) {
+          logger.trace(s"${req.uri} -> ${resp.status.intValue()}")
+        }
+        UriHandled(req.uri, resp.status, resp.headers)
+      } ~> notifyHandled
 
-      val res = handleStatus.out(0).flatMapConcat { case (req, resp) =>
+      val res = zipbcast.out(1).filter { case (req, resp) =>
+          if (resp.status.intValue() != 200) {
+            resp.entity.discardBytes(rootMat)
+            false
+          } else true
+      }.flatMapConcat { case (req, resp) =>
         AkkaSpider.parsePage(req, resp).map(d => ProcessedDocument(req.uri, d, resp.headers))
       }
-      handleStatus.out(1).map { case (req, resp) =>
-        resp.entity.discardBytes(rootMat)
-        HandleRedirect(req, resp)
-      } ~> actorSender.in1
-
-      handleStatus.out(2).to(Sink.foreach { case (req, resp) => resp.entity.discardBytes(rootMat) })
 
       SourceShape(res.outlet)
     }
@@ -126,13 +125,7 @@ class RequestFactory {
     `Accept-Language`(
       LanguageRange(Language("ja"), 1.0f),
       LanguageRange(Language("ja_JP"), 1.0f),
-      LanguageRange(Language("en"), 0.5f)),
-    `Accept-Charset`(HttpCharsetRange(HttpCharsets.`UTF-8`)),
-    Connection("keep-alive"),
-    `User-Agent`(
-      ProductVersion("KU-akka-bot", "0.1-beta"),
-      ProductVersion("akka-http", "2.4.11")
-    )
+      LanguageRange(Language("en"), 0.5f))
   )
 
   def make(uri: Uri): HttpRequest = {
@@ -151,7 +144,7 @@ trait BaseUriFilter {
   def isCompletelyForbidden(): Boolean
 }
 
-class UrlFilter(robots: BaseRobotRules) extends BaseUriFilter {
+class UrlFilter(val robots: BaseRobotRules) extends BaseUriFilter {
   def shouldAllow(uri: Uri): Boolean = {
     val strval = uri.path.toString()
     robots.isAllowed(strval)
@@ -163,19 +156,10 @@ class UrlFilter(robots: BaseRobotRules) extends BaseUriFilter {
 class HostPageSource extends ActorPublisher[HttpRequest] with StrictLogging {
 
   private val requests = new mutable.Queue[HttpRequest]()
+  private var canStop = false
 
   def send(req: HttpRequest): Unit = {
     onNext(req)
-  }
-
-  override def onError(cause: Throwable): Unit = {
-    super.onError(cause)
-  }
-
-
-  override def onComplete(): Unit = {
-    logger.trace("host completed")
-    super.onComplete()
   }
 
   override def receive: Receive = {
@@ -183,9 +167,34 @@ class HostPageSource extends ActorPublisher[HttpRequest] with StrictLogging {
       while (requests.nonEmpty && totalDemand > 0) {
         send(requests.dequeue())
       }
+      if (requests.isEmpty && canStop) {
+        onCompleteThenStop()
+      }
     case r: HttpRequest =>
       if (totalDemand > 0) {
         send(r)
       } else requests += r
+    case HostPageSource.Finish =>
+      if (requests.isEmpty) {
+        onCompleteThenStop()
+      } else {
+        canStop = true
+      }
+    case ActorPublisherMessage.Cancel =>
+      context.stop(self)
   }
+
+  override def preStart(): Unit = {
+    logger.trace("started")
+    super.preStart()
+  }
+
+  override def postStop(): Unit = {
+    logger.trace(s"stopped: own=$canStop")
+    super.postStop()
+  }
+}
+
+object HostPageSource {
+  case object Finish
 }

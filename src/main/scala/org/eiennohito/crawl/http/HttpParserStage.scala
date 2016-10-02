@@ -8,7 +8,7 @@ import akka.util.ByteString
 import com.optimaize.langdetect.LanguageDetectorBuilder
 import com.optimaize.langdetect.ngram.NgramExtractor
 import com.optimaize.langdetect.profiles.LanguageProfileReader
-import com.optimaize.langdetect.text.CommonTextObjectFactories
+import com.optimaize.langdetect.text.{CommonTextObjectFactories, MultiTextFilter, RemoveMinorityScriptsTextFilter, TextObjectFactoryBuilder}
 import org.jsoup.helper.JsoupUtil
 import org.jsoup.nodes.Document
 import org.jsoup.parser.Parser
@@ -57,9 +57,13 @@ object HttpParserStage {
     .create(NgramExtractor.gramLengths(1, 2, 3))
     .withProfiles(new LanguageProfileReader().readAllBuiltIn())
     .seed(0xdeadbeefL)
+    .minimalConfidence(0.7)
     .build()
 
-  private[this] val tof = CommonTextObjectFactories.forDetectingOnLargeText()
+  private[this] val tof = new TextObjectFactoryBuilder()
+      .maxTextLength(10000)
+      .withTextFilter(RemoveMinorityScriptsTextFilter.forThreshold(0.02))
+      .build()
 
   def parseDocument(len: Int, parser: Parser, data: ByteBuffer, charset: Option[String], uri: String) = {
     try {
@@ -68,13 +72,13 @@ object HttpParserStage {
       val txt = tof.forText(pdoc.text())
       val lang = detector.detect(txt)
       val theLang = if (lang.isPresent) Some(lang.get().getLanguage) else None
-      ParsedDocument(len, data, Success(pdoc), theLang)
+      ParsedDocument(len, data, Success(pdoc), theLang, charset)
     } catch {
       case e: Exception =>
         val pdoc = Failure(e)
-        ParsedDocument(len, data, pdoc, None)
+        ParsedDocument(len, data, pdoc, None, charset)
     }
   }
 }
 
-case class ParsedDocument(read: Int, bytes: ByteBuffer, document: Try[Document], lang: Option[String])
+case class ParsedDocument(read: Int, bytes: ByteBuffer, document: Try[Document], lang: Option[String], charset: Option[String])
