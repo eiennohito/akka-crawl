@@ -6,10 +6,6 @@ import akka.actor.{Actor, ActorRef, ActorRefFactory, PoisonPill, Props}
 import akka.http.scaladsl.model.Uri
 import akka.http.scaladsl.model.Uri.Path
 import com.google.common.collect.MinMaxPriorityQueue
-import com.optimaize.langdetect.LanguageDetectorBuilder
-import com.optimaize.langdetect.ngram.NgramExtractor
-import com.optimaize.langdetect.profiles.LanguageProfileReader
-import com.optimaize.langdetect.text.CommonTextObjectFactories
 import com.typesafe.scalalogging.StrictLogging
 import io.mola.galimatias.URL
 import org.jsoup.nodes.{Document, Node}
@@ -67,27 +63,7 @@ object NumberHandler {
 
 class CrawlContext(spider: AkkaSpider)(implicit sender: ActorRef) extends StrictLogging {
 
-  private val detector = LanguageDetectorBuilder
-    .create(NgramExtractor.gramLengths(1, 2, 3))
-    .withProfiles(new LanguageProfileReader().readAllBuiltIn())
-    .seed(0xdeadbeefL)
-    .build()
-
-  val tof = CommonTextObjectFactories.forDetectingOnLargeText()
-
   def extractImpl(refer: Uri, d: Document): Unit = {
-    val txt = d.text()
-
-
-    val data = tof.forText(txt)
-
-    val lng = detector.detect(data)
-
-    if (!lng.isPresent || lng.get().getLanguage != "ja") {
-      logger.trace(s"$refer was not Jp enough, it was $lng")
-      return
-    }
-
     val trav = new NodeTraversor(new NodeVisitor {
       private val baseUrl = URL.parse(refer.toString())
       override def head(node: Node, depth: Int): Unit = {
@@ -129,6 +105,12 @@ class CrawlContext(spider: AkkaSpider)(implicit sender: ActorRef) extends Strict
   }
 
   def extract(doc: ProcessedDocument): Unit = {
+    val lang = doc.doc.lang
+    if (!lang.contains("ja")) {
+      logger.trace(s"${doc.uri} was not Jp enough, it was $lang")
+      return
+    }
+
     doc.doc.document match {
       case Success(d) => extractImpl(doc.uri, d)
       case Failure(e) => logger.trace(s"failed to process ${doc.uri}", e)

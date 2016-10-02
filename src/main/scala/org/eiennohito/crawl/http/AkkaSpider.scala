@@ -90,7 +90,7 @@ object AkkaSpider extends StrictLogging {
 
       val handleStatus = b.add(Partition[ReqResp](3, { case (_, resp) =>
         val status = resp.status
-        if (status.isSuccess()) 0
+        if (status.intValue() == 200) 0
         else if (status.isRedirection()) 1
         else 2
       }))
