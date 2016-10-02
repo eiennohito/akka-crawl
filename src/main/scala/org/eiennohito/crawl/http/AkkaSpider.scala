@@ -123,7 +123,10 @@ object AkkaSpider extends StrictLogging {
 class RequestFactory {
 
   val headers = List(
-    `Accept-Language`(LanguageRange(Language("jp"), 1.0f), LanguageRange(Language("en"), 0.5f)),
+    `Accept-Language`(
+      LanguageRange(Language("ja"), 1.0f),
+      LanguageRange(Language("ja_JP"), 1.0f),
+      LanguageRange(Language("en"), 0.5f)),
     `Accept-Charset`(HttpCharsetRange(HttpCharsets.`UTF-8`)),
     Connection("keep-alive"),
     `User-Agent`(
