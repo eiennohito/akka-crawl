@@ -3,13 +3,13 @@ package org.eiennohito.crawl.http
 import java.io.InputStream
 import java.nio.ByteBuffer
 
-import akka.http.scaladsl.model.Uri
+import akka.http.scaladsl.model.headers.`Content-Type`
+import akka.http.scaladsl.model.{ContentType, Uri}
 import com.typesafe.scalalogging.StrictLogging
 import crawlercommons.robots.SimpleRobotRules.RobotRulesMode
 import crawlercommons.robots.{BaseRobotRules, SimpleRobotRules, SimpleRobotRulesParser}
 import org.apache.commons.io.IOUtils
 
-import scala.concurrent.{ExecutionContext, Future}
 import scala.util.Failure
 
 object HostHandler extends StrictLogging {
@@ -19,6 +19,9 @@ object HostHandler extends StrictLogging {
   case object HandleRobots
   case object RobotsUnavailable
   case object MaybeComplete
+  case object CheckIfAlive
+
+  val ForceResendMessage = 1000 * 60 * 10L
 
   def parseRobots(doc: ProcessedDocument, botName: String): Option[BaseRobotRules] = {
     parseRobots(
@@ -66,6 +69,17 @@ object HostHandler extends StrictLogging {
         } finally {
           stream.close()
         }
+
+        val ctype = input.getContentType match {
+          case null => Nil
+          case s => ContentType.parse(s) match {
+            case Right(t) => List(
+              `Content-Type`(t)
+            )
+            case _ => Nil
+          }
+        }
+
         Some(ProcessedDocument(
           uri,
           ParsedDocument(
@@ -75,7 +89,7 @@ object HostHandler extends StrictLogging {
             None,
             None
           ),
-          Nil
+          ctype
         ))
       } catch {
         case e: Exception => None

@@ -1,5 +1,7 @@
 package org.eiennohito.crawl.http
 
+import java.util.concurrent.TimeUnit
+
 import akka.NotUsed
 import akka.actor.{Actor, ActorRef, Terminated}
 import akka.actor.Status.Failure
@@ -12,6 +14,7 @@ import crawlercommons.robots.BaseRobotRules
 
 import scala.collection.mutable
 import scala.concurrent.TimeoutException
+import scala.util.Random
 
 /**
   * @author eiennohito
@@ -24,6 +27,9 @@ class HostHandler2(base: Uri, spider: AkkaSpider) extends Actor with StrictLoggi
 
   private val robotsUri = base.withPath(Uri.Path("/robots.txt"))
   private val rf = new RequestFactory
+  private val rnd = new Random()
+
+  def randMills = FiniteDuration(rnd.nextInt(200), TimeUnit.MILLISECONDS)
 
   private val httpPipeline = {
     val meAsSink1 = Sink.actorRef(self, NotUsed)
@@ -42,7 +48,10 @@ class HostHandler2(base: Uri, spider: AkkaSpider) extends Actor with StrictLoggi
 
   private var terminateConnections = false
 
+  private var lastRequest = System.currentTimeMillis()
+
   def requestOne(req: HttpRequest): Unit = {
+    lastRequest = System.currentTimeMillis()
     if (requester == null) {
       val (ac, _) = httpPipeline.run()(spider.rootMat)
       requester = ac
@@ -109,7 +118,9 @@ class HostHandler2(base: Uri, spider: AkkaSpider) extends Actor with StrictLoggi
             case _ => finishCrawl()
           }
         case 403 | 404 => startCrawl(spider.timeout) //no robots.txt, everything is allowed
-        case _ => finishCrawl()
+        case code =>
+          logger.trace(s"got unhandlable code $code for $base robots.txt")
+          finishCrawl()
       }
     case doc: ProcessedDocument =>
       parseRobots(doc, spider.botName) match {
@@ -161,7 +172,7 @@ class HostHandler2(base: Uri, spider: AkkaSpider) extends Actor with StrictLoggi
 
   private def doProcess(after: FiniteDuration, u: Uri) = {
     val req = rf.make(u)
-    context.system.scheduler.scheduleOnce(after, self, req)(context.dispatcher)
+    context.system.scheduler.scheduleOnce(after + randMills, self, req)(context.dispatcher)
   }
 
   private def maybeRetry(waitTime: FiniteDuration, e: Throwable): Unit = {
@@ -200,7 +211,6 @@ class HostHandler2(base: Uri, spider: AkkaSpider) extends Actor with StrictLoggi
                 val resolved = if (u.isRelative) u.resolvedAgainst(uh.uri) else u
                 self ! resolved
               }
-              doNext(waitTime)
             case _ => //do nothing
           }
           doNext(waitTime)
@@ -220,9 +230,17 @@ class HostHandler2(base: Uri, spider: AkkaSpider) extends Actor with StrictLoggi
     case Failure(e) => maybeRetry(waitTime, e)
   }
 
+  private val cancel = context.system.scheduler.schedule(15.minutes, 5.minutes, self, CheckIfAlive)(context.dispatcher)
+
   override def preStart(): Unit = {
     super.preStart()
     requestOne(robotsUri)
+  }
+
+
+  override def postStop(): Unit = {
+    super.postStop()
+    cancel.cancel()
   }
 
   def crawling(waitTime: FiniteDuration) = crawlingBase(waitTime) orElse default
@@ -233,6 +251,11 @@ class HostHandler2(base: Uri, spider: AkkaSpider) extends Actor with StrictLoggi
   private def default: Receive = {
     case req: HttpRequest =>
       requestOne(req)
+    case CheckIfAlive =>
+      val eplaced = System.currentTimeMillis() - lastRequest
+      if (eplaced > ForceResendMessage) {
+        doNext(spider.timeout)
+      }
     case NotUsed =>
     case Terminated(a) =>
       requester = null
