@@ -5,6 +5,9 @@ import java.util.Comparator
 import akka.actor.{Actor, ActorRef, ActorRefFactory, PoisonPill, Props}
 import akka.http.scaladsl.model.Uri
 import akka.http.scaladsl.model.Uri.Path
+import akka.stream.OverflowStrategy
+import akka.stream.scaladsl.{Sink, Source}
+import com.google.common.cache.CacheBuilder
 import com.google.common.collect.MinMaxPriorityQueue
 import com.typesafe.scalalogging.StrictLogging
 import io.mola.galimatias.URL
@@ -12,6 +15,7 @@ import org.jsoup.nodes.{Document, Node}
 import org.jsoup.select.{NodeTraversor, NodeVisitor}
 
 import scala.collection.JavaConverters._
+import scala.collection.generic.Growable
 import scala.collection.mutable
 import scala.util.{Failure, Success}
 
@@ -20,13 +24,14 @@ import scala.util.{Failure, Success}
   * @since 2016/10/01
   */
 class NumberHandler(spider: AkkaSpider, maxConcurrent: Int) extends Actor with StrictLogging {
+
   import NumberHandler._
 
   import scala.concurrent.duration._
 
   private val ctx = new CrawlContext(spider)
 
-  private val cancel = context.system.scheduler.schedule(3.seconds, 1.minute, self, StartCrawl)(context.dispatcher)
+  private val cancel = context.system.scheduler.schedule(3.seconds, 5.seconds, self, StartCrawl)(context.dispatcher)
   private val reporting = context.system.scheduler.schedule(5.seconds, 5.seconds, self, Report)(context.dispatcher)
 
   private var numBytes = 0L
@@ -39,7 +44,7 @@ class NumberHandler(spider: AkkaSpider, maxConcurrent: Int) extends Actor with S
     case doc: ProcessedDocument =>
       numDocs += 1
       numBytes += doc.doc.read
-      ctx.extract(doc)
+      docProcessor.offer(doc)
     case Report => report()
     case uri: Uri => ctx.addUri(uri)
   }
@@ -54,18 +59,60 @@ class NumberHandler(spider: AkkaSpider, maxConcurrent: Int) extends Actor with S
     cancel.cancel()
     reporting.cancel()
   }
+
+  private val docProcessor = {
+    val input = Source.queue[ProcessedDocument](100, OverflowStrategy.backpressure)
+    val sink = Sink.actorRef(self, Report)
+    val graph = input.flatMapMerge(6, d => {
+      val bldr = Set.newBuilder[Uri]
+      val proc = new DocProcessor(spider, bldr)
+      proc.extract(d)
+      Source.apply(bldr.result())
+    }).to(sink)
+    graph.run()(spider.rootMat)
+  }
 }
 
 object NumberHandler {
+
   case object StartCrawl
+
   case object Report
+
 }
 
 
-class CrawlContext(spider: AkkaSpider)(implicit sender: ActorRef) extends StrictLogging {
+class DocProcessor(spider: AkkaSpider, bldr: Growable[Uri]) extends StrictLogging {
+
+  def extract(doc: ProcessedDocument): Unit = {
+    val lang = doc.doc.lang
+    if (!lang.contains("ja") && doc.uri.path != Path.SingleSlash) {
+      logger.trace(s"${doc.uri} was not Jp enough, it was $lang: ${doc.doc.charset}")
+      return
+    }
+
+    doc.doc.document match {
+      case Success(d) => extractImpl(doc.uri, d)
+      case Failure(e) => logger.trace(s"failed to process ${doc.uri}", e)
+    }
+  }
+
+  def handleUri(base: Uri, uri: Uri) = {
+    if (uri.isAbsolute) {
+      addUri(uri)
+    } else {
+      val resolved = uri.resolvedAgainst(base)
+      addUri(resolved)
+    }
+  }
+
+  def addUri(uri: Uri) = bldr += uri.withoutFragment
+
   def extractImpl(refer: Uri, d: Document): Unit = {
+
     val trav = new NodeTraversor(new NodeVisitor {
       private val baseUrl = URL.parse(refer.toString())
+
       override def head(node: Node, depth: Int): Unit = {
         if (node.nodeName() == "a") {
           if (node.hasAttr("href")) {
@@ -100,38 +147,33 @@ class CrawlContext(spider: AkkaSpider)(implicit sender: ActorRef) extends Strict
           }
         }
       }
+
       override def tail(node: Node, depth: Int): Unit = {}
     })
     trav.traverse(d)
   }
 
-  def extract(doc: ProcessedDocument): Unit = {
-    val lang = doc.doc.lang
-    if (!lang.contains("ja") && doc.uri.path != Path.SingleSlash) {
-      logger.trace(s"${doc.uri} was not Jp enough, it was $lang: ${doc.doc.charset}")
-      return
-    }
+}
 
-    doc.doc.document match {
-      case Success(d) => extractImpl(doc.uri, d)
-      case Failure(e) => logger.trace(s"failed to process ${doc.uri}", e)
-    }
-  }
+
+class CrawlContext(spider: AkkaSpider)(implicit sender: ActorRef) extends StrictLogging {
 
   def skip(base: Uri): Unit = {
     logger.trace(s"host $base was skipped")
-    ignore.add(base)
+    ignore.put(base, Integer.valueOf(100))
+    active.remove(base).foreach(_ ! PoisonPill)
   }
 
   def complete(uri: Uri): Unit = {
     logger.trace(s"host $uri is completed")
+    ignore.put(uri, cachedWeight(uri) + 20)
     active.remove(uri).foreach(_ ! PoisonPill)
   }
 
   def addUri(uri: Uri): Unit = {
     val base = CrawlContext.baseUri(uri)
 
-    if (ignore.contains(base)) return
+    if (cachedWeight(uri) >= 100) return
 
     active.get(base) match {
       case Some(actor) => actor ! uri
@@ -158,9 +200,18 @@ class CrawlContext(spider: AkkaSpider)(implicit sender: ActorRef) extends Strict
     }
   }
 
+  def cachedWeight(uri: Uri) = {
+    val present = ignore.getIfPresent(uri)
+    if (present == null) { 0 } else present.intValue()
+  }
+
   val pending = new mutable.HashMap[Uri, mutable.HashSet[Uri]]()
   val active = new mutable.HashMap[Uri, ActorRef]()
-  val ignore = new mutable.HashSet[Uri]()
+
+  val ignore =
+    CacheBuilder.newBuilder()
+      .maximumSize(300000)
+      .build[Uri, Integer]()
 
   var links = 0L
 
@@ -184,7 +235,8 @@ class CrawlContext(spider: AkkaSpider)(implicit sender: ActorRef) extends Strict
     }).maximumSize(toLaunch).create[(Uri, Int)]()
 
     for ((u, m) <- pending) {
-      heap.add((u, m.size))
+      val weight = m.size - cachedWeight(u)
+      heap.add((u, weight))
     }
 
     logger.trace(s"selected ${heap.size()}/$toLaunch hosts")
@@ -192,12 +244,10 @@ class CrawlContext(spider: AkkaSpider)(implicit sender: ActorRef) extends Strict
   }
 
   def startCrawl(fact: ActorRefFactory, maxConcurrent: Int): Unit = {
-    val launchBorder = (maxConcurrent * 5 / 100) max 1 //5% of maxValue, but not less than one
+    val launchBorder = 100 max (pending.size * 2 / 100 + 1)
     val running = active.size
     val toLaunch = maxConcurrent - running
-    if (toLaunch >= launchBorder) {
-      doStart(toLaunch, fact)
-    }
+    doStart(toLaunch min launchBorder, fact)
   }
 }
 
