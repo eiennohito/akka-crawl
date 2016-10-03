@@ -5,10 +5,12 @@ import java.nio.file.Paths
 import akka.actor.{ActorSystem, Props}
 import akka.http.scaladsl.model.Uri
 import akka.http.scaladsl.model.Uri.Path
+import akka.stream.OverflowStrategy
+import akka.stream.scaladsl.Source
 import com.typesafe.config.ConfigFactory
 import com.typesafe.scalalogging.StrictLogging
 import org.apache.commons.io.IOUtils
-import org.apache.tika.language.LanguageIdentifier
+import org.eiennohito.crawl.storage.Output
 
 import scala.annotation.tailrec
 import scala.collection.JavaConverters._
@@ -39,9 +41,33 @@ object CrawlerMain extends StrictLogging {
     val rootProps = Props(new NumberHandler(spider, conc))
     val actor = asys.actorOf(rootProps, "base")
 
+    if (cfg.hasPath("crawler.output.uris")) {
+      val path = Paths.get(cfg.getString("crawler.output.uris"))
+      val size = if(cfg.hasPath("crawler.output.uris-batch")) {
+        cfg.getInt("crawler.output.uris-batch")
+      } else 100000
 
+      logger.info(s"saving uris to: $path, split after $size lines")
 
-    LanguageIdentifier.initProfiles()
+      val sink = Output.saveUris(path, size)
+      val src = Source.actorRef[UriHandled](5000, OverflowStrategy.dropNew)
+      val ref = sink.runWith(src)(spider.rootMat)
+      asys.eventStream.subscribe(ref, classOf[UriHandled])
+    }
+
+    if (cfg.hasPath("crawler.output.html")) {
+      val path = Paths.get(cfg.getString("crawler.output.html"))
+      val size = if(cfg.hasPath("crawler.output.html-batch")) {
+        cfg.getBytes("crawler.output.html-batch").longValue()
+      } else 200 * 1024 * 1024L
+
+      logger.info(s"saving html to: $path, split after $size uncompressed bytes")
+
+      val sink = Output.saveDocs(path, size)
+      val src = Source.actorRef[ProcessedDocument](500, OverflowStrategy.dropNew)
+      val ref = sink.runWith(src)(spider.rootMat)
+      asys.eventStream.subscribe(ref, classOf[ProcessedDocument])
+    }
 
     roots.asScala.foreach { l =>
       actor ! Uri(l)

@@ -78,6 +78,7 @@ class HostHandler2(base: Uri, spider: AkkaSpider) extends Actor with StrictLoggi
   def robotsBase: Receive = {
     case u: Uri => pending += u
     case uh: UriHandled =>
+      context.system.eventStream.publish(uh)
       uh.status.intValue() match {
         case 200 => //wait for actual content
         case _ if uh.status.isRedirection() =>
@@ -105,7 +106,7 @@ class HostHandler2(base: Uri, spider: AkkaSpider) extends Actor with StrictLoggi
               }
             case _ => finishCrawl()
           }
-        case 404 => startCrawl(spider.timeout) //no robots.txt, everything is allowed
+        case 403 | 404 => startCrawl(spider.timeout) //no robots.txt, everything is allowed
         case _ => finishCrawl()
       }
     case doc: ProcessedDocument =>
@@ -182,6 +183,7 @@ class HostHandler2(base: Uri, spider: AkkaSpider) extends Actor with StrictLoggi
         pending += u
       }
     case uh: UriHandled =>
+      context.system.eventStream.publish(uh)
       viewed.add(uh.uri.path)
       val s = uh.status
       s.intValue() match {

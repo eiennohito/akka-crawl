@@ -45,6 +45,9 @@ class NumberHandler(spider: AkkaSpider, maxConcurrent: Int) extends Actor with S
       numDocs += 1
       numBytes += doc.doc.read
       docProcessor.offer(doc)
+      if (doc.doc.lang.contains("ja")) {
+        context.system.eventStream.publish(doc)
+      }
     case Report => report()
     case uri: Uri => ctx.addUri(uri)
   }
@@ -74,11 +77,8 @@ class NumberHandler(spider: AkkaSpider, maxConcurrent: Int) extends Actor with S
 }
 
 object NumberHandler {
-
   case object StartCrawl
-
   case object Report
-
 }
 
 
@@ -247,7 +247,9 @@ class CrawlContext(spider: AkkaSpider)(implicit sender: ActorRef) extends Strict
     val launchBorder = 100 max (pending.size * 2 / 100 + 1)
     val running = active.size
     val toLaunch = maxConcurrent - running
-    doStart(toLaunch min launchBorder, fact)
+    if (toLaunch > 0) {
+      doStart(toLaunch min launchBorder, fact)
+    }
   }
 }
 
