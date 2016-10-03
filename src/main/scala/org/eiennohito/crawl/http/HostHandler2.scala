@@ -82,8 +82,8 @@ class HostHandler2(base: Uri, spider: AkkaSpider) extends Actor with StrictLoggi
       uh.status.intValue() match {
         case 200 => //wait for actual content
         case _ if uh.status.isRedirection() =>
-          uh.headers.find(_.is("location")).foreach {
-            case l: Location =>
+          uh.headers.find(_.is("location")) match {
+            case Some(l: Location) =>
               val u = l.uri.withoutFragment
 
               if (u.isAbsolute && u.authority != base.authority) {
@@ -99,6 +99,8 @@ class HostHandler2(base: Uri, spider: AkkaSpider) extends Actor with StrictLoggi
                 if (redirects.contains(resolved)) {
                   logger.trace(s"redirect loop on $base robots.txt, treat as missing")
                   startCrawl(spider.timeout)
+                } else if (redirects.size > 10) {
+                  logger.trace(s"too many redirects for $base robots.txt, last is ${uh.uri}")
                 } else {
                   logger.trace(s"robots txt redirect: ${uh.uri} -> $resolved")
                   doProcess(spider.timeout, resolved)
