@@ -1,6 +1,6 @@
 package org.eiennohito.crawl.http
 
-import java.nio.file.Paths
+import java.nio.file.{Files, Paths}
 
 import akka.actor.{ActorSystem, Props}
 import akka.http.scaladsl.model.Uri
@@ -14,8 +14,33 @@ import org.eiennohito.crawl.storage.Output
 
 import scala.annotation.tailrec
 import scala.collection.JavaConverters._
+import scala.collection.mutable
 
 object CrawlerMain extends StrictLogging {
+
+  def handleRoots(globs: mutable.Buffer[String]): Seq[String] = {
+    val x = for (g <- globs) yield try {
+      val p = Paths.get(g)
+      val nameGlob = p.getFileName.toString
+      val dir = p.getParent
+      if (dir == null) { List(p) } else {
+        val str = Files.newDirectoryStream(dir, nameGlob)
+        val bldr = List.newBuilder[java.nio.file.Path]
+        try {
+          bldr ++= str.iterator().asScala
+        } finally {
+          str.close()
+        }
+        bldr.result()
+      }
+    } catch {
+      case e: Exception =>
+        logger.warn(s"could not process globs: $globs")
+        Nil
+    }
+    x.flatMap { l => l.flatMap { p => Files.readAllLines(p).asScala }}
+  }
+
   def main(args: Array[String]): Unit = {
     val defaultConfig = ConfigFactory.defaultApplication().withFallback(ConfigFactory.defaultOverrides())
 
@@ -33,6 +58,12 @@ object CrawlerMain extends StrictLogging {
     val spider = new AkkaSpider(asys, new StringBasedFilter(ignored))
 
     val roots = IOUtils.readLines(getClass.getClassLoader.getResourceAsStream("roots.txt"))
+    val otherRootFiles = cfg.getStringList("crawler.roots")
+    val otherRoots = handleRoots(otherRootFiles.asScala)
+
+    val allRoots = roots.asScala ++ otherRoots
+
+    logger.info(s"using ${allRoots.size} roots")
 
     val conc = cfg.getInt("crawler.concurrency")
 
@@ -69,7 +100,7 @@ object CrawlerMain extends StrictLogging {
       asys.eventStream.subscribe(ref, classOf[ProcessedDocument])
     }
 
-    roots.asScala.foreach { l =>
+    allRoots.foreach { l =>
       actor ! Uri(l)
     }
 
