@@ -93,7 +93,7 @@ class HostHandler2(base: Uri, spider: AkkaSpider) extends Actor with StrictLoggi
         case _ if uh.status.isRedirection() =>
           uh.headers.find(_.is("location")) match {
             case Some(l: Location) =>
-              val u = l.uri.withoutFragment
+              val u = l.uri
 
               if (u.isAbsolute && u.authority != base.authority) {
                 getBots(u) match {
@@ -117,7 +117,7 @@ class HostHandler2(base: Uri, spider: AkkaSpider) extends Actor with StrictLoggi
               }
             case _ => finishCrawl()
           }
-        case 403 | 404 => startCrawl(spider.timeout) //no robots.txt, everything is allowed
+        case 400 | 403 | 404 | 500 => startCrawl(spider.timeout) //no robots.txt, everything is allowed
         case code =>
           logger.trace(s"got unhandlable code $code for $base robots.txt")
           finishCrawl()
@@ -145,8 +145,13 @@ class HostHandler2(base: Uri, spider: AkkaSpider) extends Actor with StrictLoggi
           }
       }
     case akka.actor.Status.Failure(e) =>
-      logger.trace(s"could not acquire robots.txt from $base", e)
-      finishCrawl()
+      if (trialNumber > 2) {
+        logger.trace(s"could not acquire robots.txt from $base", e)
+        finishCrawl()
+      } else {
+        trialNumber += 1
+        doProcess(spider.timeout + 5 * randMills, robotsUri)
+      }
   }
 
   var pending: Set[Uri] = Set.empty
